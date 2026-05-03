@@ -27,6 +27,7 @@ train:
   gamma: 0.99            # discount factor
   learning_rate: 3.0e-4
   critic_lr: 1.0e-3      # critic learns faster than policy (standard A2C practice)
+  entropy_coef: 0.01     # entropy bonus weight — keeps policy stochastic
   baseline_momentum: 0.05 # EMA update rate for REINFORCE scalar baseline
   log_interval: 20       # print stats every N episodes
   save_interval: 100     # save checkpoint every N episodes
@@ -35,6 +36,7 @@ train:
 psl:
   n_pref_samples: 8      # preference vectors per update batch (K)
   n_episodes_per_pref: 15 # episodes per λ for gradient estimation (min 10–20; 3 is too noisy)
+  entropy_coef: 0.01     # entropy bonus weight — keeps policy stochastic
   solver: epo            # LibMOON solver: epo | ls | cosmos
 
 # ── Evaluation ───────────────────────────────────────────────────────────────

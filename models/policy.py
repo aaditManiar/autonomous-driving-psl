@@ -68,26 +68,31 @@ class ConditionedPolicy(nn.Module):
         self,
         obs: torch.Tensor,
         lam: torch.Tensor,
-    ) -> tuple[int, torch.Tensor]:
+        return_entropy: bool = False,
+    ) -> tuple[int, torch.Tensor] | tuple[int, torch.Tensor, torch.Tensor]:
         """
         Sample an action and return its log-probability.
 
         Used during episode collection. The log-probability is kept as a
-        computation graph leaf so REINFORCE can differentiate through it.
+        computation graph leaf so A2C can differentiate through it.
 
         Parameters
         ----------
         obs : Tensor [obs_dim]   — single (un-batched) observation
         lam : Tensor [lam_dim]   — single preference vector
+        return_entropy : bool    — also return H(π(·|obs, λ)) in the same forward pass
 
         Returns
         -------
-        action  : int
+        action   : int
         log_prob : Tensor scalar  — log π(action | obs, λ)
+        entropy  : Tensor scalar  — H(π(·|obs, λ)), only when return_entropy=True
         """
         logits = self.forward(obs, lam)
         dist = Categorical(logits=logits)
         action = dist.sample()
+        if return_entropy:
+            return action.item(), dist.log_prob(action), dist.entropy()
         return action.item(), dist.log_prob(action)
 
     def action_distribution(

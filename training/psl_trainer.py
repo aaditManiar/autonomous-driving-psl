@@ -93,6 +93,7 @@ class PSLConfig:
     learning_rate: float = 3e-4
     critic_lr: float = 1e-3
     grad_clip: float = 0.5
+    entropy_coef: float = 0.01        # weight on entropy bonus — prevents policy collapse
     log_interval: int = 5
     save_interval: int = 25
     checkpoint_dir: str = "checkpoints/psl"
@@ -188,23 +189,31 @@ class PSLTrainer:
             losses_for_critic: list[torch.Tensor] = []
 
             for _ in range(N):
-                returns, log_probs, values = collect_episode(
+                returns, log_probs, values, entropies = collect_episode(
                     self.env, self.policy, self.critic, lam_np,
                     gamma=cfg.gamma, device=self.device,
                 )
-                # Aggregate this episode's (T, 3) advantage signal.
                 advantages = (returns - values).detach()             # (T, 3)
-                # We'll combine across N episodes by averaging the per-objective losses.
-                # Build per-objective policy loss (cost form — minimise).
-                #   L_i = mean_t [ A_i(t) * log π_t ]
-                # Mean across timesteps per objective. log_probs is shared.
+
                 T = log_probs.shape[0]
                 weighted = advantages * log_probs.unsqueeze(1)       # (T, 3)
-                per_obj = weighted.mean(dim=0)                       # (3,)
+                # Entropy bonus: subtract entropy from each objective's loss so that
+                # gradient descent also pushes the policy toward higher entropy
+                # (more exploration). The same entropy term appears in all 3 rows of
+                # the Jacobian, so EPO mixes it with net coefficient Σα_i = 1.
+                per_obj = weighted.mean(dim=0) - cfg.entropy_coef * entropies.mean()  # (3,)
 
-                # Per-objective values for EPO: use cumulative cost from t=0
-                # (lower = better, matches LibMOON's minimisation convention).
-                obj_values.append(returns[0].detach().cpu().numpy())  # (3,)
+                # Per-objective values for EPO: use mean per-step cost so values
+                # stay in [0, 1] and EPO's LP is properly calibrated across objectives.
+                # Recover per-step costs from consecutive discounted returns:
+                #   r[t] = G[t] - γ·G[t+1]  (valid for t < T-1)
+                if T > 1:
+                    returns_np = returns.detach().cpu().numpy()      # (T, 3)
+                    step_costs_np = returns_np[:-1] - cfg.gamma * returns_np[1:]  # (T-1, 3)
+                    mean_step_cost = step_costs_np.mean(axis=0)      # (3,) in [0, 1]
+                else:
+                    mean_step_cost = returns[0].detach().cpu().numpy()
+                obj_values.append(mean_step_cost)
 
                 # Critic MSE (joint across objectives and timesteps).
                 losses_for_critic.append(((returns - values) ** 2).mean())

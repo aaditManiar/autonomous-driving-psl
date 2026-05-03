@@ -94,8 +94,11 @@ class MOHighwayEnv(gym.Wrapper):
 
     def reset(self, **kwargs):
         """Reset the environment and clear accumulated state."""
-        self._prev_acceleration = 0.0
         obs, info = self.env.reset(**kwargs)
+        # Seed from the actual initial ego acceleration so the first jerk
+        # computation is not artificially spiked against a zero baseline.
+        ego = self.env.unwrapped.vehicle
+        self._prev_acceleration = float(ego.action.get("acceleration", 0.0))
         return obs, info
 
     def step(self, action: int):

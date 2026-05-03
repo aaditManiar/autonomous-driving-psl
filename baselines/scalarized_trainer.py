@@ -93,6 +93,7 @@ def train(
     gamma         = t_cfg["gamma"]
     lr            = t_cfg["learning_rate"]
     critic_lr     = t_cfg["critic_lr"]
+    entropy_coef  = t_cfg.get("entropy_coef", 0.01)
     log_interval  = t_cfg["log_interval"]
     save_interval = t_cfg["save_interval"]
 
@@ -122,7 +123,7 @@ def train(
 
     # ── Training loop ─────────────────────────────────────────────────────────
     for ep in range(1, n_episodes + 1):
-        returns, log_probs, values = collect_episode(
+        returns, log_probs, values, entropies = collect_episode(
             env, policy, critic, lam, gamma, device
         )
 
@@ -131,10 +132,8 @@ def train(
         advantages = returns - values.detach()           # (T, 3)
         scalar_adv = (advantages * lam_t).sum(dim=-1)   # (T,)
 
-        # Policy loss for cost minimisation (no negation).
-        # Gradient descent on L_policy decreases log π for high-cost steps
-        # and increases it for low-cost steps.
-        L_policy = (scalar_adv * log_probs).mean()
+        # Policy loss: cost minimisation + entropy bonus to prevent collapse.
+        L_policy = (scalar_adv * log_probs).mean() - entropy_coef * entropies.mean()
 
         # Critic loss: MSE across all objectives and all timesteps.
         L_critic = ((returns - values) ** 2).mean()
