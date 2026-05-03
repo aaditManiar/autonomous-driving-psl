@@ -1,0 +1,43 @@
+# ── Environment ──────────────────────────────────────────────────────────────
+env:
+  lanes_count: 4
+  vehicles_count: 30
+  duration: 40           # seconds per episode
+  policy_frequency: 2    # Hz — agent acts at 2 Hz, dt = 0.5s
+  simulation_frequency: 15
+
+# ── Objective constants ───────────────────────────────────────────────────────
+objectives:
+  v_max: 30.0            # m/s — target speed
+  ttc_threshold: 5.0     # seconds — iTTC reference
+  min_safe_dist: 10.0    # metres — hard gap floor
+  max_jerk: 5.0          # m/s³ — jerk normalisation
+  max_lat_acc: 3.0       # m/s² — lateral acc normalisation
+
+# ── Policy network ────────────────────────────────────────────────────────────
+policy:
+  obs_dim: 25            # 5 vehicles × 5 features, flattened
+  lam_dim: 3             # preference vector dimension
+  hidden_dim: 256
+  n_actions: 5           # LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER
+
+# ── Training (single-λ A2C) ───────────────────────────────────────────────────
+train:
+  n_episodes: 500
+  gamma: 0.99            # discount factor
+  learning_rate: 3.0e-4
+  critic_lr: 1.0e-3      # critic learns faster than policy (standard A2C practice)
+  baseline_momentum: 0.05 # EMA update rate for REINFORCE scalar baseline
+  log_interval: 20       # print stats every N episodes
+  save_interval: 100     # save checkpoint every N episodes
+
+# ── PSL training (Phase 3) ───────────────────────────────────────────────────
+psl:
+  n_pref_samples: 8      # preference vectors per update batch (K)
+  n_episodes_per_pref: 15 # episodes per λ for gradient estimation (min 10–20; 3 is too noisy)
+  solver: epo            # LibMOON solver: epo | ls | cosmos
+
+# ── Evaluation ───────────────────────────────────────────────────────────────
+eval:
+  n_lambda_points: 100   # λ grid points for Pareto surface evaluation
+  n_eval_episodes: 5     # episodes per λ point

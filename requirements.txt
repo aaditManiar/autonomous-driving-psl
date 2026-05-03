@@ -1,0 +1,27 @@
+# --- Core RL / env ---
+highway-env>=1.10
+gymnasium>=0.29
+torch>=2.2
+numpy>=1.26
+pyyaml>=6.0
+matplotlib>=3.8
+
+# --- LibMOON (gradient-based MOO) ---
+# PyPI 0.0.1 is a stub — install from GitHub with --no-deps so its torch==2.2.1
+# pin doesn't conflict with newer torch wheels:
+#     pip install --no-deps git+https://github.com/xzhang2523/libmoon.git
+libmoon @ git+https://github.com/xzhang2523/libmoon.git
+
+# --- LibMOON's undeclared transitive deps (must be installed manually) ---
+seaborn>=0.13           # pulled by libmoon.util.constant
+cvxpy>=1.5              # EPO LP solve
+cvxopt>=1.3             # MGDA quadratic program
+opencv-python>=4.9      # libmoon.util.general imports cv2
+pymoo>=0.6              # libmoon problem definitions
+tqdm>=4.66              # libmoon training progress bars
+scikit-learn>=1.4       # libmoon utilities
+pandas>=2.2             # libmoon logging/results
+
+# --- Notebook tooling ---
+jupyter>=1.0
+ipykernel>=6.29
