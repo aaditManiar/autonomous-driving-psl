@@ -31,6 +31,7 @@ network is trained on a balanced gradient signal that respects each preference.
 from __future__ import annotations
 
 import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -42,7 +43,7 @@ from libmoon.solver.gradient.methods.epo_solver import EPOCore
 from envs import MOHighwayEnv
 from models.policy import ConditionedPolicy
 from models.critic import VectorCritic
-from training.rollout import collect_episode, episode_summary
+from training.parallel_worker import collect_pref_worker
 
 
 # Lower bound for any preference component before passing to EPO.
@@ -60,15 +61,6 @@ def sample_preferences(K: int, dim: int = 3, rng: np.random.Generator | None = N
     prefs = np.clip(prefs, _PREF_FLOOR, None)
     prefs /= prefs.sum(axis=1, keepdims=True)
     return prefs
-
-
-def _flat_grad(params) -> torch.Tensor:
-    """Concatenate .grad of an iterable of parameters into one flat tensor."""
-    return torch.cat([
-        (p.grad.detach().flatten() if p.grad is not None
-         else torch.zeros_like(p).flatten())
-        for p in params
-    ])
 
 
 def _write_flat_grad(params, flat: torch.Tensor) -> None:
@@ -98,6 +90,7 @@ class PSLConfig:
     save_interval: int = 25
     checkpoint_dir: str = "checkpoints/psl"
     seed: int | None = None
+    n_workers: int = 1                # parallel processes for episode collection (1 = sequential)
 
 
 @dataclass
@@ -139,6 +132,9 @@ class PSLTrainer:
         self.rng = np.random.default_rng(cfg.seed)
 
         pc = policy_config or {"obs_dim": 25, "lam_dim": 3, "hidden_dim": 256, "n_actions": 5}
+        self._policy_cfg = pc
+        self._env_cfg    = env_config or {}
+
         self.policy = ConditionedPolicy(
             obs_dim=pc["obs_dim"], lam_dim=pc["lam_dim"],
             hidden_dim=pc["hidden_dim"], n_actions=pc["n_actions"],
@@ -152,9 +148,15 @@ class PSLTrainer:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=cfg.critic_lr)
 
         self.env = MOHighwayEnv(config=env_config)
-        self.n_var = sum(p.numel() for p in self.policy.parameters())
+        self.n_var   = sum(p.numel() for p in self.policy.parameters())
+        self.n_c_var = sum(p.numel() for p in self.critic.parameters())
         self.history = PSLHistory()
-        self._step = 0
+        self._step   = 0
+
+        self._pool: Optional[ProcessPoolExecutor] = (
+            ProcessPoolExecutor(max_workers=cfg.n_workers)
+            if cfg.n_workers > 1 else None
+        )
 
     # ------------------------------------------------------------------ #
     # Core update
@@ -164,115 +166,95 @@ class PSLTrainer:
         Run one PSL update: sample K preferences, gather K×N episodes, EPO-merge
         per-objective gradients, step both policy and critic.
 
-        Returns a dict of per-update metrics.
+        When cfg.n_workers > 1 the K preference rollouts run in parallel across
+        separate processes — each worker computes its own Jacobian and critic
+        gradient, returning numpy arrays for aggregation here.
         """
         cfg = self.cfg
-        K = cfg.n_pref_samples
-        N = cfg.n_episodes_per_pref
+        K   = cfg.n_pref_samples
 
-        prefs_np = sample_preferences(K, dim=3, rng=self.rng)         # (K, 3)
+        prefs_np = sample_preferences(K, dim=3, rng=self.rng)        # (K, 3)
         prefs_t  = torch.tensor(prefs_np, dtype=torch.float32, device=self.device)
+        epo_cores = [EPOCore(n_var=self.n_var, prefs=prefs_t[k:k+1]) for k in range(K)]
 
-        # One EPOCore per preference (each LP is parameterised by 1/pref).
-        epo_cores = [EPOCore(n_var=self.n_var, prefs=prefs_t[k:k + 1]) for k in range(K)]
+        # ---- collect per-preference results (parallel or sequential) ---- #
+        if self._pool is not None:
+            results = self._collect_parallel(prefs_np)
+        else:
+            results = self._collect_sequential(prefs_np)
+        # results[k] = (J_k_np (3,n_var), v_k_np (3,), critic_grad_np (n_cvar,))
 
-        # Accumulators across K preferences.
-        agg_grad   = torch.zeros(self.n_var, device=self.device)
-        ep_returns = []       # list of (3,) arrays — final cumulative cost vectors
-        critic_losses = []
-        alphas = []
+        # ---- EPO + gradient aggregation ---- #
+        agg_policy_grad  = torch.zeros(self.n_var,   device=self.device)
+        agg_critic_grad  = torch.zeros(self.n_c_var, device=self.device)
+        ep_returns = []
+        alphas     = []
+        critic_loss_vals = []
 
-        for k in range(K):
-            lam_np = prefs_np[k]
-            jacobian_rows: list[torch.Tensor] = []
-            obj_values:    list[float] = []
-            losses_for_critic: list[torch.Tensor] = []
+        for k, (J_k_np, v_k_np, cg_np) in enumerate(results):
+            J_k = torch.tensor(J_k_np, dtype=torch.float32, device=self.device)  # (3, n_var)
+            v_k = torch.tensor(v_k_np, dtype=torch.float32, device=self.device)  # (3,)
 
-            for _ in range(N):
-                returns, log_probs, values, entropies = collect_episode(
-                    self.env, self.policy, self.critic, lam_np,
-                    gamma=cfg.gamma, device=self.device,
-                )
-                advantages = (returns - values).detach()             # (T, 3)
-
-                T = log_probs.shape[0]
-                weighted = advantages * log_probs.unsqueeze(1)       # (T, 3)
-                # Entropy bonus: subtract entropy from each objective's loss so that
-                # gradient descent also pushes the policy toward higher entropy
-                # (more exploration). The same entropy term appears in all 3 rows of
-                # the Jacobian, so EPO mixes it with net coefficient Σα_i = 1.
-                per_obj = weighted.mean(dim=0) - cfg.entropy_coef * entropies.mean()  # (3,)
-
-                # Per-objective values for EPO: use mean per-step cost so values
-                # stay in [0, 1] and EPO's LP is properly calibrated across objectives.
-                # Recover per-step costs from consecutive discounted returns:
-                #   r[t] = G[t] - γ·G[t+1]  (valid for t < T-1)
-                if T > 1:
-                    returns_np = returns.detach().cpu().numpy()      # (T, 3)
-                    step_costs_np = returns_np[:-1] - cfg.gamma * returns_np[1:]  # (T-1, 3)
-                    mean_step_cost = step_costs_np.mean(axis=0)      # (3,) in [0, 1]
-                else:
-                    mean_step_cost = returns[0].detach().cpu().numpy()
-                obj_values.append(mean_step_cost)
-
-                # Critic MSE (joint across objectives and timesteps).
-                losses_for_critic.append(((returns - values) ** 2).mean())
-
-                # Compute Jacobian for this episode by 3 backward passes.
-                ep_jac = torch.zeros(3, self.n_var, device=self.device)
-                for i in range(3):
-                    self.policy.zero_grad(set_to_none=False)
-                    retain = i < 2
-                    per_obj[i].backward(retain_graph=retain)
-                    ep_jac[i] = _flat_grad(self.policy.parameters())
-                jacobian_rows.append(ep_jac)
-
-            # Average Jacobian and objective values across the N episodes for this λ.
-            J_k = torch.stack(jacobian_rows, dim=0).mean(dim=0)              # (3, n_var)
-            v_k = torch.tensor(np.mean(obj_values, axis=0), dtype=torch.float32)  # (3,)
-
-            # EPO mixing weights for this preference.
-            alpha_k = epo_cores[k].get_alpha(J_k, v_k, idx=0).to(J_k.device)  # (3,)
+            alpha_k = epo_cores[k].get_alpha(J_k, v_k, idx=0).to(self.device)   # (3,)
             alphas.append(alpha_k.detach().cpu().numpy())
 
-            # Aggregated gradient for this λ.
-            g_k = alpha_k @ J_k                                              # (n_var,)
-            agg_grad = agg_grad + g_k
+            agg_policy_grad += alpha_k @ J_k
+            agg_critic_grad += torch.tensor(cg_np, dtype=torch.float32, device=self.device)
+            ep_returns.append(v_k_np)
+            # Approximate critic loss for logging: mean squared norm of critic grad
+            critic_loss_vals.append(float(np.mean(cg_np ** 2)))
 
-            ep_returns.append(v_k.numpy())
-            critic_losses.append(torch.stack(losses_for_critic).mean())
-
-        agg_grad = agg_grad / K
+        agg_policy_grad /= K
+        agg_critic_grad /= K
 
         # ---------------- Policy update ---------------- #
-        _write_flat_grad(self.policy.parameters(), agg_grad)
+        _write_flat_grad(self.policy.parameters(), agg_policy_grad)
         torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=cfg.grad_clip)
         self.policy_opt.step()
 
         # ---------------- Critic update ---------------- #
-        self.critic_opt.zero_grad()
-        L_critic_total = torch.stack(critic_losses).mean()
-        L_critic_total.backward()
+        _write_flat_grad(self.critic.parameters(), agg_critic_grad)
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=cfg.grad_clip)
         self.critic_opt.step()
 
         # ---------------- Logging ---------------- #
-        mean_returns = np.mean(np.stack(ep_returns), axis=0)
-        mean_alpha   = np.mean(np.stack(alphas), axis=0)
+        mean_returns    = np.mean(np.stack(ep_returns), axis=0)
+        mean_alpha      = np.mean(np.stack(alphas), axis=0)
+        mean_critic_loss = float(np.mean(critic_loss_vals))
         self._step += 1
         self.history.update.append(self._step)
         self.history.G_safety.append(float(mean_returns[0]))
         self.history.G_speed.append(float(mean_returns[1]))
         self.history.G_comfort.append(float(mean_returns[2]))
-        self.history.L_critic.append(float(L_critic_total.item()))
+        self.history.L_critic.append(mean_critic_loss)
         self.history.alpha_mean.append(mean_alpha)
 
         return {
-            "step":      self._step,
-            "G":         mean_returns,
-            "alpha":     mean_alpha,
-            "L_critic":  float(L_critic_total.item()),
+            "step":     self._step,
+            "G":        mean_returns,
+            "alpha":    mean_alpha,
+            "L_critic": mean_critic_loss,
         }
+
+    def _build_worker_args(self, lam_np: np.ndarray, seed: int) -> tuple:
+        policy_sd_np = {k: v.cpu().numpy() for k, v in self.policy.state_dict().items()}
+        critic_sd_np = {k: v.cpu().numpy() for k, v in self.critic.state_dict().items()}
+        return (
+            policy_sd_np, critic_sd_np, lam_np,
+            self.cfg.n_episodes_per_pref, self.cfg.gamma, self.cfg.entropy_coef,
+            self._policy_cfg, self._env_cfg, seed,
+        )
+
+    def _collect_sequential(self, prefs_np: np.ndarray) -> list:
+        seeds = self.rng.integers(0, 2**31, size=len(prefs_np))
+        return [collect_pref_worker(self._build_worker_args(prefs_np[k], int(seeds[k])))
+                for k in range(len(prefs_np))]
+
+    def _collect_parallel(self, prefs_np: np.ndarray) -> list:
+        K = len(prefs_np)
+        seeds = self.rng.integers(0, 2**31, size=K)
+        args = [self._build_worker_args(prefs_np[k], int(seeds[k])) for k in range(K)]
+        return list(self._pool.map(collect_pref_worker, args))
 
     # ------------------------------------------------------------------ #
     # Full training loop
@@ -317,3 +299,6 @@ class PSLTrainer:
 
     def close(self) -> None:
         self.env.close()
+        if self._pool is not None:
+            self._pool.shutdown(wait=False)
+            self._pool = None
