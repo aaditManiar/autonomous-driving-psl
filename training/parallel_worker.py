@@ -55,9 +55,11 @@ def collect_pref_worker(args):
 
     Returns
     -------
-    J_k          : np.ndarray (3, n_var)   — mean policy Jacobian across N episodes
-    v_k          : np.ndarray (3,)         — mean per-step objective costs (for EPO)
-    critic_grad  : np.ndarray (n_cvar,)    — mean critic gradient across N episodes
+    J_k             : np.ndarray (3, n_var)   — mean policy Jacobian across N episodes
+    v_k             : np.ndarray (3,)         — mean per-step objective costs (for EPO)
+    critic_grad     : np.ndarray (n_cvar,)    — mean critic gradient across N episodes
+    policy_loss_vec : np.ndarray (3,)         — mean per-objective policy loss (incl. entropy bonus)
+    critic_loss     : float                   — mean MSE of (returns − values) across N episodes
     """
     (policy_sd_np, critic_sd_np, lam_np, n_episodes,
      gamma, entropy_coef, policy_cfg, env_cfg, seed) = args
@@ -90,9 +92,11 @@ def collect_pref_worker(args):
     env = MOHighwayEnv(config=env_cfg)
     n_var = sum(p.numel() for p in policy.parameters())
 
-    jacobian_rows: list[np.ndarray] = []
-    obj_values:    list[np.ndarray] = []
-    critic_grads:  list[np.ndarray] = []
+    jacobian_rows:    list[np.ndarray] = []
+    obj_values:       list[np.ndarray] = []
+    critic_grads:     list[np.ndarray] = []
+    policy_loss_vecs: list[np.ndarray] = []
+    critic_losses:    list[float]      = []
 
     for _ in range(n_episodes):
         returns, log_probs, values, entropies = collect_episode(
@@ -103,6 +107,7 @@ def collect_pref_worker(args):
         T = log_probs.shape[0]
         weighted = advantages * log_probs.unsqueeze(1) # (T, 3)
         per_obj = weighted.mean(dim=0) - entropy_coef * entropies.mean()  # (3,)
+        policy_loss_vecs.append(per_obj.detach().cpu().numpy().copy())
 
         # Per-step costs for EPO calibration (must be in [0, 1])
         if T > 1:
@@ -114,8 +119,10 @@ def collect_pref_worker(args):
 
         # Critic gradient — graph is independent of policy (advantages are detached)
         critic.zero_grad()
-        ((returns - values) ** 2).mean().backward()
+        critic_loss = ((returns - values) ** 2).mean()
+        critic_loss.backward()
         critic_grads.append(_flat_grad(critic.parameters()).numpy().copy())
+        critic_losses.append(float(critic_loss.detach().cpu().item()))
 
         # Policy Jacobian — 3 separate backward passes, one per objective
         ep_jac = np.zeros((3, n_var), dtype=np.float32)
@@ -128,7 +135,9 @@ def collect_pref_worker(args):
     env.close()
 
     return (
-        np.mean(jacobian_rows, axis=0),   # (3, n_var)
-        np.mean(obj_values,    axis=0),   # (3,)
-        np.mean(critic_grads,  axis=0),   # (n_cvar,)
+        np.mean(jacobian_rows,    axis=0),   # (3, n_var)
+        np.mean(obj_values,       axis=0),   # (3,)
+        np.mean(critic_grads,     axis=0),   # (n_cvar,)
+        np.mean(policy_loss_vecs, axis=0),   # (3,)
+        float(np.mean(critic_losses)),       # scalar
     )

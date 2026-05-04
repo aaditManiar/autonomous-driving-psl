@@ -4,17 +4,27 @@ Preference-conditioned policy network.
 Takes the flattened observation AND a preference vector λ as input, outputs
 action logits over the 5 discrete highway-env actions.
 
-Concatenating λ to the observation is equivalent to a shallow hypernetwork:
-the network learns to modulate its behaviour based on the preference context.
-This is cheaper and more stable than a true PHN that outputs full weight tensors.
+λ is re-concatenated at every layer's input AND scaled up before injection.
+The scaling raises λ's magnitude well above typical normalised obs values so
+the linear layers cannot cheaply zero out the λ pathway during training. This
+is the structural anti-collapse mechanism for PSL: the network is *forced*
+to use λ because it dominates the input.
 
 Architecture:
-    [obs (25) ++ λ (3)] → Linear(28→256) → ReLU → Linear(256→256) → ReLU → Linear(256→5)
+    [obs (25), LAM_SCALE * λ (3)]    → Linear(28→hidden)  → ReLU
+    [h1, LAM_SCALE * λ (3)]          → Linear(hidden+3→hidden) → ReLU
+    [h2, LAM_SCALE * λ (3)]          → Linear(hidden+3→n_actions) → logits
 """
 
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
+
+
+# λ values arrive in [0, 1] (simplex). Multiply before feeding into the
+# network so each component is on the order of typical pre-activation scale,
+# making it harder for downstream weights to ignore.
+LAM_SCALE = 10.0
 
 
 class ConditionedPolicy(nn.Module):
@@ -42,13 +52,9 @@ class ConditionedPolicy(nn.Module):
         self.obs_dim = obs_dim
         self.lam_dim = lam_dim
 
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + lam_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, n_actions),
-        )
+        self.l1 = nn.Linear(obs_dim    + lam_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim + lam_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim + lam_dim, n_actions)
 
     def forward(self, obs: torch.Tensor, lam: torch.Tensor) -> torch.Tensor:
         """
@@ -61,8 +67,10 @@ class ConditionedPolicy(nn.Module):
         -------
         logits : Tensor [..., n_actions]
         """
-        x = torch.cat([obs, lam], dim=-1)
-        return self.net(x)
+        lam_s = lam * LAM_SCALE
+        h = torch.relu(self.l1(torch.cat([obs, lam_s], dim=-1)))
+        h = torch.relu(self.l2(torch.cat([h,   lam_s], dim=-1)))
+        return self.l3(torch.cat([h, lam_s], dim=-1))
 
     def act(
         self,

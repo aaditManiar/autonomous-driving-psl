@@ -65,16 +65,16 @@ def compute_safety(ego, road_vehicles: list, crashed: bool) -> float:
         if gap <= 0:
             continue  # front vehicles only
 
-        # iTTC — worst case across all front vehicles
+        # iTTC — worst case across all front vehicles.
+        # Smooth: iTTC = clip(TTC_THRESHOLD / TTC, 0, 1).
+        # Always positive when closing → continuous gradient at all TTC values
+        # rather than zero above the threshold.
         rel_speed = ego_speed - v.speed
         if rel_speed > 0:
             ttc = gap / rel_speed
+            candidate_ittc = float(np.clip(TTC_THRESHOLD / ttc, 0.0, 1.0))
         else:
-            ttc = float('inf')  # not closing — no TTC risk
-
-        candidate_ittc = float(np.clip(
-            (TTC_THRESHOLD - ttc) / TTC_THRESHOLD, 0.0, 1.0
-        ))
+            candidate_ittc = 0.0  # not closing — no TTC risk
         ittc = max(ittc, candidate_ittc)
 
         # dist_violation — continuous, worst case across front vehicles

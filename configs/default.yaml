@@ -1,9 +1,10 @@
 # ── Environment ──────────────────────────────────────────────────────────────
 env:
-  lanes_count: 4
-  vehicles_count: 30
-  duration: 40           # seconds per episode
-  policy_frequency: 2    # Hz — agent acts at 2 Hz, dt = 0.5s
+  lanes_count: 3            # was 4 — same cars on fewer lanes for higher density
+  vehicles_count: 50        # was 30 — more lead-vehicle interactions per step
+  vehicles_density: 1.5     # was 1.0 (default) — tighter spawn spacing
+  duration: 25              # seconds per episode
+  policy_frequency: 2       # Hz — agent acts at 2 Hz, dt = 0.5s
   simulation_frequency: 15
 
 # ── Objective constants ───────────────────────────────────────────────────────
@@ -18,7 +19,7 @@ objectives:
 policy:
   obs_dim: 25            # 5 vehicles × 5 features, flattened
   lam_dim: 3             # preference vector dimension
-  hidden_dim: 256
+  hidden_dim: 128        # was 256 — halved for ~30% faster forward/backward
   n_actions: 5           # LANE_LEFT, IDLE, LANE_RIGHT, FASTER, SLOWER
 
 # ── Training (single-λ A2C) ───────────────────────────────────────────────────

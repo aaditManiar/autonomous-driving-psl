@@ -51,13 +51,34 @@ from training.parallel_worker import collect_pref_worker
 _PREF_FLOOR = 1e-3
 
 
-def sample_preferences(K: int, dim: int = 3, rng: np.random.Generator | None = None) -> np.ndarray:
+def sample_preferences(
+    K: int,
+    dim: int = 3,
+    rng: np.random.Generator | None = None,
+    p_corner: float = 0.0,
+) -> np.ndarray:
     """
-    Sample K preference vectors uniformly on the (dim-1)-simplex via Dirichlet(α=1).
+    Sample K preference vectors on the (dim-1)-simplex via Dirichlet(α=1).
     Returns shape (K, dim), each row sums to 1, components ≥ _PREF_FLOOR.
+
+    With p_corner > 0, replace each sample with a near-corner λ
+    (one component ≈ 1-ε, others ≈ ε) with that probability, picking
+    the corner uniformly among the `dim` axes. This guards against
+    the policy collapsing on the simplex interior because Dirichlet(1)
+    almost never produces samples near the corners.
     """
     rng = rng or np.random.default_rng()
     prefs = rng.dirichlet(alpha=np.ones(dim), size=K).astype(np.float32)
+
+    if p_corner > 0.0:
+        replace_mask = rng.random(K) < p_corner
+        n_replace = int(replace_mask.sum())
+        if n_replace > 0:
+            corner_axes = rng.integers(0, dim, size=n_replace)
+            corners = np.full((n_replace, dim), _PREF_FLOOR, dtype=np.float32)
+            corners[np.arange(n_replace), corner_axes] = 1.0 - _PREF_FLOOR * (dim - 1)
+            prefs[replace_mask] = corners
+
     prefs = np.clip(prefs, _PREF_FLOOR, None)
     prefs /= prefs.sum(axis=1, keepdims=True)
     return prefs
@@ -86,6 +107,7 @@ class PSLConfig:
     critic_lr: float = 1e-3
     grad_clip: float = 0.5
     entropy_coef: float = 0.01        # weight on entropy bonus — prevents policy collapse
+    p_corner: float = 0.25            # fraction of sampled λ replaced with near-corner one-hot — forces the policy to see extreme preferences
     log_interval: int = 5
     save_interval: int = 25
     checkpoint_dir: str = "checkpoints/psl"
@@ -100,7 +122,10 @@ class PSLHistory:
     G_safety:  list[float] = field(default_factory=list)
     G_speed:   list[float] = field(default_factory=list)
     G_comfort: list[float] = field(default_factory=list)
-    L_critic:  list[float] = field(default_factory=list)
+    L_critic:  list[float] = field(default_factory=list)         # mean MSE of (returns − values)
+    L_policy_safety:  list[float] = field(default_factory=list)  # per-objective policy loss
+    L_policy_speed:   list[float] = field(default_factory=list)
+    L_policy_comfort: list[float] = field(default_factory=list)
     alpha_mean: list[np.ndarray] = field(default_factory=list)   # mean EPO α across K prefs
 
 
@@ -173,7 +198,7 @@ class PSLTrainer:
         cfg = self.cfg
         K   = cfg.n_pref_samples
 
-        prefs_np = sample_preferences(K, dim=3, rng=self.rng)        # (K, 3)
+        prefs_np = sample_preferences(K, dim=3, rng=self.rng, p_corner=cfg.p_corner)  # (K, 3)
         prefs_t  = torch.tensor(prefs_np, dtype=torch.float32, device=self.device)
         epo_cores = [EPOCore(n_var=self.n_var, prefs=prefs_t[k:k+1]) for k in range(K)]
 
@@ -182,16 +207,18 @@ class PSLTrainer:
             results = self._collect_parallel(prefs_np)
         else:
             results = self._collect_sequential(prefs_np)
-        # results[k] = (J_k_np (3,n_var), v_k_np (3,), critic_grad_np (n_cvar,))
+        # results[k] = (J_k_np (3,n_var), v_k_np (3,), critic_grad_np (n_cvar,),
+        #               policy_loss_vec_np (3,), critic_loss_scalar)
 
         # ---- EPO + gradient aggregation ---- #
         agg_policy_grad  = torch.zeros(self.n_var,   device=self.device)
         agg_critic_grad  = torch.zeros(self.n_c_var, device=self.device)
-        ep_returns = []
-        alphas     = []
+        ep_returns       = []
+        alphas           = []
+        policy_loss_vecs = []
         critic_loss_vals = []
 
-        for k, (J_k_np, v_k_np, cg_np) in enumerate(results):
+        for k, (J_k_np, v_k_np, cg_np, pl_vec_np, cl_scalar) in enumerate(results):
             J_k = torch.tensor(J_k_np, dtype=torch.float32, device=self.device)  # (3, n_var)
             v_k = torch.tensor(v_k_np, dtype=torch.float32, device=self.device)  # (3,)
 
@@ -201,8 +228,8 @@ class PSLTrainer:
             agg_policy_grad += alpha_k @ J_k
             agg_critic_grad += torch.tensor(cg_np, dtype=torch.float32, device=self.device)
             ep_returns.append(v_k_np)
-            # Approximate critic loss for logging: mean squared norm of critic grad
-            critic_loss_vals.append(float(np.mean(cg_np ** 2)))
+            policy_loss_vecs.append(pl_vec_np)
+            critic_loss_vals.append(cl_scalar)
 
         agg_policy_grad /= K
         agg_critic_grad /= K
@@ -218,8 +245,9 @@ class PSLTrainer:
         self.critic_opt.step()
 
         # ---------------- Logging ---------------- #
-        mean_returns    = np.mean(np.stack(ep_returns), axis=0)
-        mean_alpha      = np.mean(np.stack(alphas), axis=0)
+        mean_returns     = np.mean(np.stack(ep_returns), axis=0)
+        mean_alpha       = np.mean(np.stack(alphas), axis=0)
+        mean_policy_loss = np.mean(np.stack(policy_loss_vecs), axis=0)   # (3,)
         mean_critic_loss = float(np.mean(critic_loss_vals))
         self._step += 1
         self.history.update.append(self._step)
@@ -227,6 +255,9 @@ class PSLTrainer:
         self.history.G_speed.append(float(mean_returns[1]))
         self.history.G_comfort.append(float(mean_returns[2]))
         self.history.L_critic.append(mean_critic_loss)
+        self.history.L_policy_safety.append(float(mean_policy_loss[0]))
+        self.history.L_policy_speed.append(float(mean_policy_loss[1]))
+        self.history.L_policy_comfort.append(float(mean_policy_loss[2]))
         self.history.alpha_mean.append(mean_alpha)
 
         return {
@@ -234,6 +265,7 @@ class PSLTrainer:
             "G":        mean_returns,
             "alpha":    mean_alpha,
             "L_critic": mean_critic_loss,
+            "L_policy": mean_policy_loss,
         }
 
     def _build_worker_args(self, lam_np: np.ndarray, seed: int) -> tuple:
@@ -265,11 +297,12 @@ class PSLTrainer:
         for step in range(1, cfg.n_updates + 1):
             info = self.update_once()
             if step % cfg.log_interval == 0:
-                G = info["G"]; a = info["alpha"]
+                G = info["G"]; a = info["alpha"]; lp = info["L_policy"]
                 print(
                     f"PSL upd {step:3d}/{cfg.n_updates}"
                     f"  G=[s={G[0]:.3f} v={G[1]:.3f} c={G[2]:.3f}]"
                     f"  α=[{a[0]:.2f} {a[1]:.2f} {a[2]:.2f}]"
+                    f"  L_pol=[{lp[0]:+.3f} {lp[1]:+.3f} {lp[2]:+.3f}]"
                     f"  L_crit={info['L_critic']:.4f}"
                 )
             if step % cfg.save_interval == 0:
