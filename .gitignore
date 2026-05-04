@@ -10,8 +10,6 @@ __pycache__/
 venv/
 env/
 
-# Checkpoints (large binary files — use Git LFS or external storage)
-checkpoints/
 
 # macOS
 .DS_Store
