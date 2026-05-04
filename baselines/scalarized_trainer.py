@@ -25,8 +25,10 @@ Usage (CLI):
 """
 
 import argparse
+import csv
 import os
 import sys
+import time
 
 import numpy as np
 import torch
@@ -39,6 +41,13 @@ from envs import MOHighwayEnv
 from models.policy import ConditionedPolicy
 from models.critic import VectorCritic
 from training.rollout import collect_episode, episode_summary
+
+
+def _fmt_eta(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
 
 
 PRESETS: dict[str, np.ndarray] = {
@@ -66,16 +75,20 @@ def train(
     checkpoint_dir: str = "checkpoints",
     device: str = "cpu",
     n_episodes_override: int | None = None,
+    n_episodes_per_update: int = 5,
+    log_interval_override: int | None = None,
 ) -> None:
     """
     Train a scalarized A2C baseline for one fixed λ preset.
 
     Parameters
     ----------
-    lam_name       : one of "safety", "speed", "comfort", "uniform"
-    cfg            : parsed default.yaml dict; loaded from disk if None
-    checkpoint_dir : root directory; checkpoints go to <checkpoint_dir>/<lam_name>/
-    device         : torch device string
+    lam_name             : one of "safety", "speed", "comfort", "uniform"
+    cfg                  : parsed default.yaml dict; loaded from disk if None
+    checkpoint_dir       : root directory; checkpoints go to <checkpoint_dir>/<lam_name>/
+    device               : torch device string
+    n_episodes_per_update: episodes to collect before each gradient update (mini-batch)
+    log_interval_override: print/CSV interval in episodes; overrides config value
     """
     if lam_name not in PRESETS:
         raise ValueError(f"Unknown preset '{lam_name}'. Choose from: {list(PRESETS)}")
@@ -94,7 +107,7 @@ def train(
     lr            = t_cfg["learning_rate"]
     critic_lr     = t_cfg["critic_lr"]
     entropy_coef  = t_cfg.get("entropy_coef", 0.01)
-    log_interval  = t_cfg["log_interval"]
+    log_interval  = log_interval_override if log_interval_override is not None else t_cfg["log_interval"]
     save_interval = t_cfg["save_interval"]
 
     # ── Models ────────────────────────────────────────────────────────────────
@@ -121,62 +134,101 @@ def train(
     # ── Environment ───────────────────────────────────────────────────────────
     env = MOHighwayEnv(config=cfg.get("env", {}))
 
+    # ── CSV log ───────────────────────────────────────────────────────────────
+    csv_path = os.path.join(ckpt_dir, "training_log.csv")
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(["episode", "G_safety", "G_speed", "G_comfort", "T", "L_policy", "L_critic"])
+
     # ── Training loop ─────────────────────────────────────────────────────────
-    for ep in range(1, n_episodes + 1):
-        returns, log_probs, values, entropies = collect_episode(
-            env, policy, critic, lam, gamma, device
-        )
+    # Losses from the current accumulation window; cleared after each update.
+    accumulated_losses: list[tuple[torch.Tensor, torch.Tensor]] = []
+    # Most-recent averaged losses, used for logging between update boundaries.
+    avg_L_policy: torch.Tensor = torch.tensor(0.0, device=device)
+    avg_L_critic: torch.Tensor = torch.tensor(0.0, device=device)
 
-        # Advantages: cost-based.  Positive A → step was worse than expected.
-        # Detach values so the policy loss does not back-prop into the critic.
-        advantages = returns - values.detach()           # (T, 3)
-        scalar_adv = (advantages * lam_t).sum(dim=-1)   # (T,)
+    t0 = time.monotonic()
 
-        # Policy loss: cost minimisation + entropy bonus to prevent collapse.
-        L_policy = (scalar_adv * log_probs).mean() - entropy_coef * entropies.mean()
-
-        # Critic loss: MSE across all objectives and all timesteps.
-        L_critic = ((returns - values) ** 2).mean()
-
-        policy_opt.zero_grad()
-        L_policy.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
-        policy_opt.step()
-
-        critic_opt.zero_grad()
-        L_critic.backward()
-        torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=0.5)
-        critic_opt.step()
-
-        if ep % log_interval == 0:
-            s = episode_summary(returns)
-            print(
-                f"[{lam_name}] ep {ep:4d}/{n_episodes}"
-                f"  G_safety={s['G_safety']:.3f}"
-                f"  G_speed={s['G_speed']:.3f}"
-                f"  G_comfort={s['G_comfort']:.3f}"
-                f"  L_pol={L_policy.item():.5f}"
-                f"  L_crit={L_critic.item():.5f}"
-                f"  T={s['length']}"
+    try:
+        for ep in range(1, n_episodes + 1):
+            returns, log_probs, values, entropies = collect_episode(
+                env, policy, critic, lam, gamma, device
             )
 
-        if ep % save_interval == 0:
-            ckpt_path = os.path.join(ckpt_dir, f"ep{ep:05d}.pt")
-            torch.save(
-                {
-                    "episode": ep,
-                    "lam_name": lam_name,
-                    "lam": lam,
-                    "policy_state_dict": policy.state_dict(),
-                    "critic_state_dict": critic.state_dict(),
-                    "policy_opt_state_dict": policy_opt.state_dict(),
-                    "critic_opt_state_dict": critic_opt.state_dict(),
-                },
-                ckpt_path,
-            )
-            print(f"  → saved {ckpt_path}")
+            # Advantages: cost-based.  Positive A → step was worse than expected.
+            # Detach values so the policy loss does not back-prop into the critic.
+            advantages = returns - values.detach()           # (T, 3)
+            scalar_adv = (advantages * lam_t).sum(dim=-1)   # (T,)
 
-    env.close()
+            # Policy loss: cost minimisation + entropy bonus to prevent collapse.
+            L_policy = (scalar_adv * log_probs).mean() - entropy_coef * entropies.mean()
+
+            # Critic loss: MSE across all objectives and all timesteps.
+            L_critic = ((returns - values) ** 2).mean()
+
+            accumulated_losses.append((L_policy, L_critic))
+
+            # Update once per n_episodes_per_update episodes (or at the very end).
+            if ep % n_episodes_per_update == 0 or ep == n_episodes:
+                avg_L_policy = torch.stack([l[0] for l in accumulated_losses]).mean()
+                avg_L_critic = torch.stack([l[1] for l in accumulated_losses]).mean()
+
+                policy_opt.zero_grad()
+                avg_L_policy.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
+                policy_opt.step()
+
+                critic_opt.zero_grad()
+                avg_L_critic.backward()
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=0.5)
+                critic_opt.step()
+
+                accumulated_losses = []
+
+            if ep % log_interval == 0:
+                s = episode_summary(returns)
+                elapsed = time.monotonic() - t0
+                eta = _fmt_eta(elapsed / ep * (n_episodes - ep))
+                print(
+                    f"[{lam_name}] ep {ep:5d}/{n_episodes}"
+                    f"  G_safety={s['G_safety']:.3f}"
+                    f"  G_speed={s['G_speed']:.3f}"
+                    f"  G_comfort={s['G_comfort']:.3f}"
+                    f"  T={s['length']:3d}"
+                    f"  L_pol={avg_L_policy.item():.5f}"
+                    f"  L_crit={avg_L_critic.item():.5f}"
+                    f"  ETA {eta}",
+                    flush=True,
+                )
+                csv_writer.writerow([
+                    ep,
+                    f"{s['G_safety']:.5f}",
+                    f"{s['G_speed']:.5f}",
+                    f"{s['G_comfort']:.5f}",
+                    s["length"],
+                    f"{avg_L_policy.item():.6f}",
+                    f"{avg_L_critic.item():.6f}",
+                ])
+                csv_file.flush()
+
+            if ep % save_interval == 0:
+                ckpt_path = os.path.join(ckpt_dir, f"ep{ep:05d}.pt")
+                torch.save(
+                    {
+                        "episode": ep,
+                        "lam_name": lam_name,
+                        "lam": lam,
+                        "policy_state_dict": policy.state_dict(),
+                        "critic_state_dict": critic.state_dict(),
+                        "policy_opt_state_dict": policy_opt.state_dict(),
+                        "critic_opt_state_dict": critic_opt.state_dict(),
+                    },
+                    ckpt_path,
+                )
+                print(f"  → saved {ckpt_path}", flush=True)
+    finally:
+        csv_file.close()
+        env.close()
 
 
 def main() -> None:
@@ -210,18 +262,32 @@ def main() -> None:
         default=None,
         help="Override n_episodes from config",
     )
+    parser.add_argument(
+        "--n_episodes_per_update",
+        type=int,
+        default=5,
+        help="Episodes to collect before each gradient update (default: 5)",
+    )
+    parser.add_argument(
+        "--log_interval",
+        type=int,
+        default=None,
+        help="Print/CSV interval in episodes; overrides config value (default: use config)",
+    )
     args = parser.parse_args()
 
     presets_to_run = list(PRESETS) if args.all else [args.lam]
     for preset in presets_to_run:
-        print(f"\n{'=' * 60}")
-        print(f"  Training baseline: {preset}  λ = {PRESETS[preset]}")
-        print(f"{'=' * 60}\n")
+        print(f"\n{'=' * 60}", flush=True)
+        print(f"  Training baseline: {preset}  λ = {PRESETS[preset]}", flush=True)
+        print(f"{'=' * 60}\n", flush=True)
         train(
             lam_name=preset,
             checkpoint_dir=args.checkpoint_dir,
             device=args.device,
             n_episodes_override=args.episodes,
+            n_episodes_per_update=args.n_episodes_per_update,
+            log_interval_override=args.log_interval,
         )
 
 
