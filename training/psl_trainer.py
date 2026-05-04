@@ -222,7 +222,14 @@ class PSLTrainer:
             J_k = torch.tensor(J_k_np, dtype=torch.float32, device=self.device)  # (3, n_var)
             v_k = torch.tensor(v_k_np, dtype=torch.float32, device=self.device)  # (3,)
 
-            alpha_k = epo_cores[k].get_alpha(J_k, v_k, idx=0).to(self.device)   # (3,)
+            # Normalise each Jacobian row to unit norm before passing to EPO.
+            # Without this, the safety row (nonzero iTTC everywhere after the formula fix)
+            # has consistently larger magnitude than speed/comfort rows, causing EPO's LP
+            # to treat safety as always dominant and return α≈[1,0,0] regardless of λ.
+            row_norms = J_k.norm(dim=1, keepdim=True).clamp(min=1e-8)
+            J_k_epo   = J_k / row_norms
+
+            alpha_k = epo_cores[k].get_alpha(J_k_epo, v_k, idx=0).to(self.device)   # (3,)
             alphas.append(alpha_k.detach().cpu().numpy())
 
             agg_policy_grad += alpha_k @ J_k

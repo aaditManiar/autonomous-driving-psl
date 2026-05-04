@@ -31,9 +31,8 @@ def _episode_costs(env: MOHighwayEnv, policy: ConditionedPolicy,
     while not done:
         obs_t = torch.tensor(obs.flatten(), dtype=torch.float32, device=device)
         with torch.no_grad():
-            logits = policy(obs_t, lam_t)
             if greedy:
-                action = int(logits.argmax().item())
+                action = int(policy(obs_t, lam_t).argmax().item())
             else:
                 action, _ = policy.act(obs_t, lam_t)
         obs, cost_vec, terminated, truncated, _ = env.step(action)
