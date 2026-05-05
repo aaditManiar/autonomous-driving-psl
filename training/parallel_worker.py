@@ -108,6 +108,7 @@ def collect_pref_worker(args):
         if crashed:
             crashes += 1
         advantages = (returns - values).detach()       # (T, 3) — detached from critic graph
+        advantages = advantages.clamp(-10.0, 10.0)    # prevent crash-dominated critic from producing explosive advantages
         # No per-objective advantage normalization: scale differences across objectives
         # carry genuine EPO signal (large safety advantages mean safety is far from optimal).
         # Cross-objective scale imbalance in the Jacobian is handled by row-norm normalization

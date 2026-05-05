@@ -181,6 +181,8 @@ class PSLTrainer:
         self.history = PSLHistory()
         self._step   = 0
 
+        self._last_crash_rate: float = 0.0   # used by entropy annealing on the next update
+
         self._pool: Optional[ProcessPoolExecutor] = (
             ProcessPoolExecutor(max_workers=cfg.n_workers)
             if cfg.n_workers > 1 else None
@@ -200,6 +202,11 @@ class PSLTrainer:
         """
         cfg = self.cfg
         K   = cfg.n_pref_samples
+
+        # Entropy annealing: when crash rate was high last update, reduce exploration so the
+        # training distribution doesn't stay crash-dominated (which confuses the critic).
+        # Floor at 20% of base so entropy never collapses entirely.
+        self._effective_entropy = cfg.entropy_coef * max(0.2, 1.0 - 1.5 * self._last_crash_rate)
 
         prefs_np = sample_preferences(K, dim=3, rng=self.rng, p_corner=cfg.p_corner)  # (K, 3)
         prefs_t  = torch.tensor(prefs_np, dtype=torch.float32, device=self.device)
@@ -262,6 +269,7 @@ class PSLTrainer:
         mean_policy_loss = np.mean(np.stack(policy_loss_vecs), axis=0)   # (3,)
         mean_critic_loss = float(np.mean(critic_loss_vals))
         mean_crash_rate  = float(np.mean(crash_rates))
+        self._last_crash_rate = mean_crash_rate   # used by entropy annealing next update
         self._step += 1
         self.history.update.append(self._step)
         self.history.G_safety.append(float(mean_returns[0]))
@@ -275,12 +283,13 @@ class PSLTrainer:
         self.history.crash_rate.append(mean_crash_rate)
 
         return {
-            "step":       self._step,
-            "G":          mean_returns,
-            "alpha":      mean_alpha,
-            "L_critic":   mean_critic_loss,
-            "L_policy":   mean_policy_loss,
-            "crash_rate": mean_crash_rate,
+            "step":        self._step,
+            "G":           mean_returns,
+            "alpha":       mean_alpha,
+            "L_critic":    mean_critic_loss,
+            "L_policy":    mean_policy_loss,
+            "crash_rate":  mean_crash_rate,
+            "entropy_coef": self._effective_entropy,
         }
 
     def _build_worker_args(self, lam_np: np.ndarray, seed: int) -> tuple:
@@ -288,7 +297,7 @@ class PSLTrainer:
         critic_sd_np = {k: v.cpu().numpy() for k, v in self.critic.state_dict().items()}
         return (
             policy_sd_np, critic_sd_np, lam_np,
-            self.cfg.n_episodes_per_pref, self.cfg.gamma, self.cfg.entropy_coef,
+            self.cfg.n_episodes_per_pref, self.cfg.gamma, self._effective_entropy,
             self._policy_cfg, self._env_cfg, seed,
         )
 
@@ -320,6 +329,7 @@ class PSLTrainer:
                     f"  L_pol=[{lp[0]:+.3f} {lp[1]:+.3f} {lp[2]:+.3f}]"
                     f"  L_crit={info['L_critic']:.4f}"
                     f"  crash={info['crash_rate']:.1%}"
+                    f"  entr={info['entropy_coef']:.4f}"
                 )
             if step % cfg.save_interval == 0:
                 self.save(os.path.join(cfg.checkpoint_dir, f"psl_upd{step:04d}.pt"))
