@@ -31,6 +31,8 @@ network is trained on a balanced gradient signal that respects each preference.
 from __future__ import annotations
 
 import os
+import warnings
+warnings.filterwarnings("ignore")
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
@@ -102,7 +104,7 @@ class PSLConfig:
     n_pref_samples: int = 8           # K preferences per update batch
     n_episodes_per_pref: int = 4      # episodes per λ for gradient estimation
     n_updates: int = 100              # outer loop iterations
-    gamma: float = 0.99
+    gamma: float = 0.97
     learning_rate: float = 3e-4
     critic_lr: float = 1e-3
     grad_clip: float = 0.5
@@ -126,7 +128,8 @@ class PSLHistory:
     L_policy_safety:  list[float] = field(default_factory=list)  # per-objective policy loss
     L_policy_speed:   list[float] = field(default_factory=list)
     L_policy_comfort: list[float] = field(default_factory=list)
-    alpha_mean: list[np.ndarray] = field(default_factory=list)   # mean EPO α across K prefs
+    alpha_mean:  list[np.ndarray] = field(default_factory=list)  # mean EPO α across K prefs
+    crash_rate:  list[float]      = field(default_factory=list)  # fraction of episodes that crashed
 
 
 class PSLTrainer:
@@ -217,8 +220,9 @@ class PSLTrainer:
         alphas           = []
         policy_loss_vecs = []
         critic_loss_vals = []
+        crash_rates      = []
 
-        for k, (J_k_np, v_k_np, cg_np, pl_vec_np, cl_scalar) in enumerate(results):
+        for k, (J_k_np, v_k_np, cg_np, pl_vec_np, cl_scalar, cr) in enumerate(results):
             J_k = torch.tensor(J_k_np, dtype=torch.float32, device=self.device)  # (3, n_var)
             v_k = torch.tensor(v_k_np, dtype=torch.float32, device=self.device)  # (3,)
 
@@ -237,6 +241,7 @@ class PSLTrainer:
             ep_returns.append(v_k_np)
             policy_loss_vecs.append(pl_vec_np)
             critic_loss_vals.append(cl_scalar)
+            crash_rates.append(cr)
 
         agg_policy_grad /= K
         agg_critic_grad /= K
@@ -256,6 +261,7 @@ class PSLTrainer:
         mean_alpha       = np.mean(np.stack(alphas), axis=0)
         mean_policy_loss = np.mean(np.stack(policy_loss_vecs), axis=0)   # (3,)
         mean_critic_loss = float(np.mean(critic_loss_vals))
+        mean_crash_rate  = float(np.mean(crash_rates))
         self._step += 1
         self.history.update.append(self._step)
         self.history.G_safety.append(float(mean_returns[0]))
@@ -266,13 +272,15 @@ class PSLTrainer:
         self.history.L_policy_speed.append(float(mean_policy_loss[1]))
         self.history.L_policy_comfort.append(float(mean_policy_loss[2]))
         self.history.alpha_mean.append(mean_alpha)
+        self.history.crash_rate.append(mean_crash_rate)
 
         return {
-            "step":     self._step,
-            "G":        mean_returns,
-            "alpha":    mean_alpha,
-            "L_critic": mean_critic_loss,
-            "L_policy": mean_policy_loss,
+            "step":       self._step,
+            "G":          mean_returns,
+            "alpha":      mean_alpha,
+            "L_critic":   mean_critic_loss,
+            "L_policy":   mean_policy_loss,
+            "crash_rate": mean_crash_rate,
         }
 
     def _build_worker_args(self, lam_np: np.ndarray, seed: int) -> tuple:
@@ -311,6 +319,7 @@ class PSLTrainer:
                     f"  α=[{a[0]:.2f} {a[1]:.2f} {a[2]:.2f}]"
                     f"  L_pol=[{lp[0]:+.3f} {lp[1]:+.3f} {lp[2]:+.3f}]"
                     f"  L_crit={info['L_critic']:.4f}"
+                    f"  crash={info['crash_rate']:.1%}"
                 )
             if step % cfg.save_interval == 0:
                 self.save(os.path.join(cfg.checkpoint_dir, f"psl_upd{step:04d}.pt"))

@@ -83,12 +83,19 @@ def collect_episode(
     costs_arr  = np.stack(step_costs)                        # (T, 3)
     returns_np = np.zeros_like(costs_arr)
 
+    crashed = bool(terminated)
+
     if truncated:
         final_obs_t = torch.tensor(obs.flatten(), dtype=torch.float32, device=device)
         with torch.no_grad():
             G = critic(final_obs_t, lam_t).cpu().numpy()    # (3,) bootstrap
+    elif crashed:
+        # Absorbing-state safety penalty: crashing means maximum safety cost forever.
+        # 1/(1-γ) is the discounted infinite sum of per-step cost=1. Clamped so
+        # γ→1 never divides by zero (max penalty = 10,000 at γ=0.9999).
+        G = np.array([1.0 / max(1.0 - gamma, 1e-4), 0.0, 0.0])
     else:
-        G = np.zeros(3)                                      # crash → no future cost
+        G = np.zeros(3)
 
     for t in reversed(range(T)):
         G = costs_arr[t] + gamma * G
@@ -99,7 +106,7 @@ def collect_episode(
     values    = torch.stack(value_list)                                        # (T,3), with grad
     entropies = torch.stack(entropy_list)                                      # (T,),  with grad
 
-    return returns, log_probs, values, entropies
+    return returns, log_probs, values, entropies, crashed
 
 
 def episode_summary(returns: torch.Tensor) -> dict:

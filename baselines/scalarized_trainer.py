@@ -29,6 +29,8 @@ import csv
 import os
 import sys
 import time
+import warnings
+warnings.filterwarnings("ignore")
 
 import numpy as np
 import torch
@@ -151,7 +153,7 @@ def train(
 
     try:
         for ep in range(1, n_episodes + 1):
-            returns, log_probs, values, entropies = collect_episode(
+            returns, log_probs, values, entropies, _crashed = collect_episode(
                 env, policy, critic, lam, gamma, device
             )
 

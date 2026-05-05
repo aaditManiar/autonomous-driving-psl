@@ -99,22 +99,19 @@ def collect_pref_worker(args):
     critic_grads:     list[np.ndarray] = []
     policy_loss_vecs: list[np.ndarray] = []
     critic_losses:    list[float]      = []
+    crashes:          int              = 0
 
     for _ in range(n_episodes):
-        returns, log_probs, values, entropies = collect_episode(
+        returns, log_probs, values, entropies, crashed = collect_episode(
             env, policy, critic, lam_np, gamma=gamma
         )
+        if crashed:
+            crashes += 1
         advantages = (returns - values).detach()       # (T, 3) — detached from critic graph
-
-        # Per-objective normalisation: divide each objective's advantages by its std.
-        # f_safety costs (~0.4) are naturally 2-3x larger than f_speed (~0.17), giving
-        # the safety Jacobian row a proportionally larger norm. Without this, alpha from
-        # EPO (e.g. [0.1, 0.8, 0.1] for speed-λ) is partially overridden by the raw
-        # magnitude imbalance, so safety still dominates the update even under speed-λ.
-        # Normalising per-objective (not per-timestep) removes the cross-objective scale
-        # artefact while preserving within-objective urgency (sign and time-ordering intact).
-        adv_std  = advantages.std(dim=0).clamp(min=1e-8)   # (3,)
-        advantages = advantages / adv_std
+        # No per-objective advantage normalization: scale differences across objectives
+        # carry genuine EPO signal (large safety advantages mean safety is far from optimal).
+        # Cross-objective scale imbalance in the Jacobian is handled by row-norm normalization
+        # in psl_trainer.py before passing to EPO — double-normalizing here suppresses that.
 
         T = log_probs.shape[0]
         weighted = advantages * log_probs.unsqueeze(1) # (T, 3)
@@ -152,4 +149,5 @@ def collect_pref_worker(args):
         np.mean(critic_grads,     axis=0),   # (n_cvar,)
         np.mean(policy_loss_vecs, axis=0),   # (3,)
         float(np.mean(critic_losses)),       # scalar
+        float(crashes) / n_episodes,         # crash rate in [0, 1]
     )
