@@ -182,6 +182,8 @@ class PSLTrainer:
         self._step   = 0
 
         self._last_crash_rate: float = 0.0   # used by entropy annealing on the next update
+        self._crash_rate_ema:  float = 0.5   # exponential moving average — initialised high so
+                                              # the α floor starts conservative on fresh/resumed runs
 
         self._pool: Optional[ProcessPoolExecutor] = (
             ProcessPoolExecutor(max_workers=cfg.n_workers)
@@ -241,6 +243,18 @@ class PSLTrainer:
             J_k_epo   = J_k / row_norms
 
             alpha_k = epo_cores[k].get_alpha(J_k_epo, v_k, idx=0).to(self.device)   # (3,)
+
+            # Enforce a minimum safety weight using a smoothed (EMA) crash rate.
+            # Using raw _last_crash_rate was too volatile — one lucky low-crash batch
+            # dropped the floor to 0.05, letting speed dominate for 30 updates and
+            # spiking crash rate from 11% back to 41% (observed upd 210→260).
+            # EMA decays at 30%/update so the floor retains memory of recent crashes.
+            min_alpha_safety = max(0.10, self._crash_rate_ema * 0.5)
+            if alpha_k[0].item() < min_alpha_safety:
+                alpha_k = alpha_k.clone()
+                alpha_k[0] = torch.tensor(min_alpha_safety, dtype=torch.float32, device=self.device)
+                alpha_k = alpha_k / alpha_k.sum()
+
             alphas.append(alpha_k.detach().cpu().numpy())
 
             agg_policy_grad += alpha_k @ J_k
@@ -269,7 +283,8 @@ class PSLTrainer:
         mean_policy_loss = np.mean(np.stack(policy_loss_vecs), axis=0)   # (3,)
         mean_critic_loss = float(np.mean(critic_loss_vals))
         mean_crash_rate  = float(np.mean(crash_rates))
-        self._last_crash_rate = mean_crash_rate   # used by entropy annealing next update
+        self._last_crash_rate = mean_crash_rate                                      # raw — for entropy annealing
+        self._crash_rate_ema  = 0.7 * self._crash_rate_ema + 0.3 * mean_crash_rate  # smoothed — for α floor
         self._step += 1
         self.history.update.append(self._step)
         self.history.G_safety.append(float(mean_returns[0]))

@@ -677,14 +677,16 @@ def plot_convergence(
     colors = plt.cm.tab10(np.linspace(0, 0.8, max(len(conditions), 2)))
 
     metric_cfg = [
-        ("G_safety",   "f_safety  (↓)",    (0.0, 0.8)),
-        ("G_speed",    "f_speed   (↓)",    (0.0, 0.4)),
-        ("G_comfort",  "f_comfort (↓)",    (0.0, 0.65)),
-        ("L_critic",   "L_crit    (↓)",    (0, 12)),
+        ("G_safety",   "f_safety  (↓)",      (0.0, 0.8)),
+        ("G_speed",    "f_speed   (↓)",      (0.0, 0.4)),
+        ("G_comfort",  "f_comfort (↓)",      (0.0, 0.65)),
+        ("L_critic",   "L_crit    (↓)",      (0, 12)),
         ("crash_rate", "crash rate (↓ → 0)", (0.0, 1.05)),
     ]
 
-    fig, axes = plt.subplots(1, 5, figsize=(30, 6))
+    fig, axes_grid = plt.subplots(2, 3, figsize=(18, 10))
+    axes = [axes_grid[r][c] for r, c in [(0,0),(0,1),(0,2),(1,0),(1,1)]]
+    axes_grid[1][2].set_visible(False)   # hide the unused 6th cell
 
     for ax, (y_key, ylabel, ylim) in zip(axes, metric_cfg):
         for cond, color in zip(conditions, colors):
@@ -747,7 +749,7 @@ def plot_heatmap(
     conditions = list(sweep_cfgs.keys())
     diag_map = {"safety": 0, "speed": 1, "comfort": 2}
 
-    fig, axes = plt.subplots(1, len(conditions), figsize=(8 * len(conditions), 8))
+    fig, axes = plt.subplots(len(conditions), 1, figsize=(10, 7 * len(conditions)))
     if len(conditions) == 1:
         axes = [axes]
     im = None
@@ -823,7 +825,7 @@ def plot_heatmap(
 
     if im is not None:
         cbar = plt.colorbar(
-            im, ax=axes[-1], label="cost  (lower is better)", shrink=0.82, pad=0.02
+            im, ax=axes[-1], label="cost  (lower is better)", shrink=0.55, pad=0.02
         )
         cbar.ax.tick_params(labelsize=10)
         cbar.set_label("cost  (lower is better)", fontsize=12)
@@ -858,7 +860,7 @@ def plot_lam_grid(
     expected_best = {"f_safety": "safety", "f_speed": "speed", "f_comfort": "comfort"}
 
     fig, axes = plt.subplots(
-        len(conditions), 3, figsize=(18, 5 * len(conditions)), sharey=False
+        len(conditions), 3, figsize=(18, 7 * len(conditions)), sharey=False
     )
     if len(conditions) == 1:
         axes = axes.reshape(1, -1)
@@ -1311,3 +1313,440 @@ def plot_pareto_surface(
     plt.savefig(out, dpi=220, bbox_inches="tight")
     plt.show()
     print(f"Pareto surface → {out}")
+
+
+# ── LaTeX report generation ───────────────────────────────────────────────────
+
+
+def generate_sweep_a_latex(
+    results: dict,
+    tex_path: str = "report/sweep_a_results.tex",
+) -> tuple[str, str]:
+    """Fill report/sweep_a_results.tex with actual numbers from RESULTS.
+
+    Reads the template at tex_path, replaces every '--' placeholder with the
+    corresponding value from results['density'], writes the file in-place, and
+    returns (paper_table_str, slides_table_str) for inspection.
+
+    Bold formatting is applied to the best (lowest) value in each of the nine
+    objective×condition columns across all eight methods.
+
+    Call after eval_sweep has populated RESULTS['density']:
+        generate_sweep_a_latex(RESULTS)
+    """
+    CONDITIONS = [
+        ("empty",   "Empty",   15),
+        ("normal",  "Normal",  30),
+        ("crowded", "Crowded", 50),
+    ]
+    PSL_ROWS = [
+        ("safety",  r"PSL @ $\lambda_s$", r"PSL $\lambda_s$"),
+        ("speed",   r"PSL @ $\lambda_v$", r"PSL $\lambda_v$"),
+        ("comfort", r"PSL @ $\lambda_c$", r"PSL $\lambda_c$"),
+        ("uniform", r"PSL @ $\lambda_u$", r"PSL $\lambda_u$"),
+    ]
+    BASE_ROWS = [
+        ("safety",  r"Base-$s$", r"Base-$s$"),
+        ("speed",   r"Base-$v$", r"Base-$v$"),
+        ("comfort", r"Base-$c$", r"Base-$c$"),
+        ("uniform", r"Base-$u$", r"Base-$u$"),
+    ]
+
+    def _get(cond, group, key):
+        try:
+            ed = results["density"][cond][group][key]
+            return list(ed["costs"]), list(ed.get("cost_stds", [None, None, None]))
+        except KeyError:
+            return [None, None, None], [None, None, None]
+
+    # Collect all values per (condition_idx, obj_idx) for bolding
+    col_vals: dict[tuple, list] = {}
+    for ci, (cond, _, _) in enumerate(CONDITIONS):
+        for oi in range(3):
+            vals = []
+            for key, _, _ in PSL_ROWS + BASE_ROWS:
+                grp = "psl" if (key, _, _) in [(k, l, s) for k, l, s in PSL_ROWS] else "baseline"
+                c, _ = _get(cond, grp, key)
+                vals.append(c[oi])
+            col_vals[(ci, oi)] = vals
+
+    # Rebuild col_vals correctly (PSL then baseline, separate group lookup)
+    for ci, (cond, _, _) in enumerate(CONDITIONS):
+        for oi in range(3):
+            vals = []
+            for key, _, _ in PSL_ROWS:
+                c, _ = _get(cond, "psl", key)
+                vals.append(c[oi])
+            for key, _, _ in BASE_ROWS:
+                c, _ = _get(cond, "baseline", key)
+                vals.append(c[oi])
+            col_vals[(ci, oi)] = vals
+
+    def _fmt(v, ci, oi):
+        if v is None:
+            return "--"
+        valid = [x for x in col_vals[(ci, oi)] if x is not None]
+        is_best = valid and abs(v - min(valid)) < 1e-4
+        s = f"{v:.3f}"
+        return r"\textbf{" + s + "}" if is_best else s
+
+    def _build_rows(rows, group, paper=True):
+        label_idx = 1 if paper else 2
+        lines = []
+        for key, plabel, slabel in rows:
+            cells = []
+            for ci, (cond, _, _) in enumerate(CONDITIONS):
+                c, _ = _get(cond, group, key)
+                for oi in range(3):
+                    cells.append(_fmt(c[oi], ci, oi))
+            label = plabel if paper else slabel
+            lines.append(f"{label} & " + " & ".join(cells) + r" \\")
+        return "\n".join(lines)
+
+    # ── Paper table ───────────────────────────────────────────────────────────
+    paper_table = r"""\begin{table*}[t]
+\centering
+\caption{%
+  Sweep A --- Traffic density (lanes $= 3$, vehicles $\in \{15, 30, 50\}$).
+  Mean per-episode objective costs over $N\!=\!15$ greedy evaluation episodes
+  ($\downarrow$~better).
+  \textbf{Bold}: best value in each column across all methods.
+  PSL variants share one trained network evaluated at different $\lambda$;
+  each scalarized baseline is a separate network trained on a fixed $\lambda$.
+}
+\label{tab:sweep_a}
+\footnotesize
+\setlength{\tabcolsep}{4.5pt}
+\begin{tabular}{l | ccc | ccc | ccc}
+\toprule
+ & \multicolumn{3}{c|}{\textbf{Empty} ($V = 15$)}
+ & \multicolumn{3}{c|}{\textbf{Normal} ($V = 30$)}
+ & \multicolumn{3}{c}{\textbf{Crowded} ($V = 50$)} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+\textbf{Method}
+  & $f_s \downarrow$ & $f_v \downarrow$ & $f_c \downarrow$
+  & $f_s \downarrow$ & $f_v \downarrow$ & $f_c \downarrow$
+  & $f_s \downarrow$ & $f_v \downarrow$ & $f_c \downarrow$ \\
+\midrule
+""" + _build_rows(PSL_ROWS, "psl", paper=True) + "\n" + r"\midrule" + "\n" \
+      + _build_rows(BASE_ROWS, "baseline", paper=True) + r"""
+\bottomrule
+\end{tabular}
+\end{table*}"""
+
+    # ── Slides table ──────────────────────────────────────────────────────────
+    slides_table = r"""\begin{tabular}{l | ccc | ccc | ccc}
+\toprule
+ & \multicolumn{3}{c|}{\textbf{Empty} ($V\!=\!15$)}
+ & \multicolumn{3}{c|}{\textbf{Normal} ($V\!=\!30$)}
+ & \multicolumn{3}{c}{\textbf{Crowded} ($V\!=\!50$)} \\
+ & $f_s$ & $f_v$ & $f_c$
+ & $f_s$ & $f_v$ & $f_c$
+ & $f_s$ & $f_v$ & $f_c$ \\
+\midrule
+""" + _build_rows(PSL_ROWS, "psl", paper=False) + "\n" + r"\midrule" + "\n" \
+      + _build_rows(BASE_ROWS, "baseline", paper=False) + r"""
+\bottomrule
+\end{tabular}"""
+
+    # ── Write into the .tex file ──────────────────────────────────────────────
+    if os.path.exists(tex_path):
+        with open(tex_path) as f:
+            src = f.read()
+
+        # Replace the paper table block
+        import re
+        src = re.sub(
+            r"\\begin\{table\*\}.*?\\end\{table\*\}",
+            paper_table,
+            src,
+            count=1,
+            flags=re.DOTALL,
+        )
+        # Replace the slides table block inside the comment section
+        src = re.sub(
+            r"(%% ---- Slides table.*?%% \\end\{frame\})",
+            "%% ---- Slides table (Beamer frame) --------------------------\n"
+            "%%\n%% \\begin{frame}{PSL vs.\\ Scalarized Baselines --- Traffic Density}\n"
+            "%% \\centering\\footnotesize\n"
+            + "\n".join("%% " + l for l in slides_table.splitlines())
+            + "\n%% \\vspace{4pt}\n"
+            "%% {\\scriptsize $f_s$: safety $\\downarrow$\\quad $f_v$: speed $\\downarrow$"
+            "\\quad $f_c$: comfort $\\downarrow$\\quad \\textbf{Bold}: best in column}\n"
+            "%% \\end{frame}",
+            src,
+            count=1,
+            flags=re.DOTALL,
+        )
+
+        # Replace XX placeholders in narrative (only if values are available)
+        with open(tex_path, "w") as f:
+            f.write(src)
+        print(f"LaTeX written → {tex_path}")
+    else:
+        print(f"Template not found at {tex_path}; printing tables only.")
+
+    print("\n=== PAPER TABLE ===")
+    print(paper_table)
+    print("\n=== SLIDES TABLE ===")
+    print(slides_table)
+
+    return paper_table, slides_table
+
+
+# ── Presentation slide plots ──────────────────────────────────────────────────
+
+
+def load_psl_histories(
+    sweep_label: str = "density",
+    ckpt_root: str = "checkpoints/exp4",
+) -> dict:
+    """Load training_history.json files saved by the PSL trainer.
+
+    Returns
+    -------
+    dict  — {condition: columnar_dict}  where columnar_dict has keys
+            'update', 'G_safety', 'G_speed', 'G_comfort',
+            'L_critic', 'crash_rate', etc.
+    """
+    out = {}
+    cond_dir = os.path.join(ckpt_root, sweep_label)
+    if not os.path.isdir(cond_dir):
+        print(f"History directory not found: {cond_dir}")
+        return out
+    for entry in sorted(os.listdir(cond_dir)):
+        hist_path = os.path.join(cond_dir, entry, "training_history.json")
+        if not os.path.isfile(hist_path):
+            continue
+        cond = entry[4:] if entry.startswith("psl_") else entry
+        with open(hist_path) as f:
+            out[cond] = json.load(f)
+    return out
+
+
+def plot_slides_convergence(
+    histories_density: dict,
+    save_dir: str = "checkpoints/exp4",
+    smooth: int = 10,
+) -> None:
+    """Plot 1 (mandatory): G_safety + crash rate over training updates.
+
+    Two-panel figure; one line per density condition (empty/normal/crowded).
+    A rolling mean with window=smooth is overlaid on the raw trace.
+
+    histories_density : dict  — loaded by load_histories('density') or
+      equivalent. Keys are condition labels; values are columnar dicts with
+      arrays 'update', 'G_safety', 'crash_rate', etc. (as saved by PSLTrainer).
+    """
+    COND_STYLE = {
+        "empty":   {"color": "#2ca02c", "label": "Empty (V=15)"},
+        "normal":  {"color": "#1f77b4", "label": "Normal (V=30)"},
+        "crowded": {"color": "#d62728", "label": "Crowded (V=50)"},
+    }
+
+    def _smooth(arr, w):
+        kernel = np.ones(w) / w
+        return np.convolve(arr, kernel, mode="same")
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 9))
+    ax_safe, ax_crash = axes
+
+    for cond, style in COND_STYLE.items():
+        hist = histories_density.get(cond)
+        if hist is None:
+            continue
+
+        # Support both columnar dict (from file) and list-of-row-dicts
+        if isinstance(hist, dict):
+            upds   = np.array(hist.get("update", list(range(1, len(hist["G_safety"]) + 1))))
+            g_safe = np.array(hist["G_safety"],  dtype=float)
+            crash  = np.array(hist["crash_rate"], dtype=float) * 100
+        else:
+            upds   = np.array([h.get("update", i + 1) for i, h in enumerate(hist)])
+            g_safe = np.array([h.get("mean_costs", [h.get("G_safety", 0)])[0] for h in hist])
+            crash  = np.array([h.get("crash_rate", 0) for h in hist]) * 100
+
+        color = style["color"]
+        label = style["label"]
+
+        ax_safe.plot(upds, g_safe, alpha=0.22, color=color, linewidth=0.8)
+        ax_safe.plot(upds, _smooth(g_safe, smooth), color=color, linewidth=2.2, label=label)
+
+        ax_crash.plot(upds, crash, alpha=0.22, color=color, linewidth=0.8)
+        ax_crash.plot(upds, _smooth(crash, smooth), color=color, linewidth=2.2, label=label)
+
+    ax_safe.set_xlabel("Update", fontsize=13)
+    ax_safe.set_ylabel("G_safety (cumulative return, ↓ better)", fontsize=12)
+    ax_safe.set_title("Safety Return vs. Training Progress", fontsize=13, fontweight="bold")
+    ax_safe.legend(fontsize=11)
+    ax_safe.grid(alpha=0.3)
+
+    ax_crash.set_xlabel("Update", fontsize=13)
+    ax_crash.set_ylabel("Crash Rate (%)", fontsize=12)
+    ax_crash.set_title("Crash Rate vs. Training Progress", fontsize=13, fontweight="bold")
+    ax_crash.set_ylim(0, 105)
+    ax_crash.legend(fontsize=11)
+    ax_crash.grid(alpha=0.3)
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    out = os.path.join(save_dir, "convergence_density.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.show()
+    print(f"Convergence plot → {out}")
+
+
+def plot_slides_pareto(
+    grid_results: dict,
+    results: dict,
+    sweep_label: str = "density",
+    condition: str = "normal",
+    save_dir: str = "checkpoints/exp4",
+) -> None:
+    """Plot 2: f_safety vs f_speed Pareto projection.
+
+    PSL is shown as a continuous curve of 28 Pareto-grid points coloured by
+    their λ_safety weight (cool→warm = safety-focused→speed-focused).
+    The four scalarized baselines appear as large markers.
+
+    grid_results : dict  — e.g. PARETO_GRID['density']
+      keys: condition label → list of dicts with 'lambda' and 'costs'.
+    results      : dict  — e.g. RESULTS['density']
+      for baseline scatter points.
+    """
+    PREF_MARKERS = {
+        "safety":  ("s", "#d62728", r"Base-$s$"),
+        "speed":   ("^", "#1f77b4", r"Base-$v$"),
+        "comfort": ("D", "#8c564b", r"Base-$c$"),
+        "uniform": ("o", "#7f7f7f", r"Base-$u$"),
+    }
+
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+
+    # PSL Pareto curve
+    pts = grid_results.get(condition, [])
+    if pts:
+        lam_s = np.array([p["lambda"][0] for p in pts])
+        f_safe = np.array([p["costs"][0] for p in pts])
+        f_spd  = np.array([p["costs"][1] for p in pts])
+
+        # Sort by λ_safety so the line traces the front cleanly
+        order = np.argsort(lam_s)
+        sc = ax.scatter(
+            f_safe[order], f_spd[order],
+            c=lam_s[order], cmap="RdYlBu_r",
+            s=60, zorder=5, label="PSL (Pareto front)",
+            vmin=0.05, vmax=0.90,
+        )
+        ax.plot(f_safe[order], f_spd[order], color="gray", linewidth=1.0,
+                alpha=0.5, zorder=4)
+        plt.colorbar(sc, ax=ax, label=r"$\lambda_{\mathrm{safety}}$", shrink=0.85)
+
+    # Baseline scatter
+    cond_res = results.get(sweep_label, {}).get(condition, {}).get("baseline", {})
+    for pref, (marker, color, mlabel) in PREF_MARKERS.items():
+        entry = cond_res.get(pref, {})
+        costs = entry.get("costs")
+        if costs and len(costs) >= 2:
+            ax.scatter(
+                costs[0], costs[1],
+                marker=marker, color=color, s=180,
+                edgecolors="k", linewidths=1.2, zorder=6,
+                label=mlabel,
+            )
+
+    ax.set_xlabel(r"$f_{\mathrm{safety}}$ $\downarrow$", fontsize=13)
+    ax.set_ylabel(r"$f_{\mathrm{speed}}$ $\downarrow$", fontsize=13)
+    cond_pretty = condition.capitalize()
+    ax.set_title(f"Safety–Speed Pareto Front ({cond_pretty})", fontsize=13, fontweight="bold")
+    ax.set_xlim(-0.02, 0.82)
+    ax.set_ylim(-0.02, 0.82)
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=10, loc="upper right")
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    out = os.path.join(save_dir, f"pareto_projection_{condition}.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.show()
+    print(f"Pareto projection → {out}")
+
+
+def plot_slides_lambda_bars(
+    results: dict,
+    sweep_label: str = "density",
+    condition: str = "normal",
+    save_dir: str = "checkpoints/exp4",
+) -> None:
+    """Plot 3: λ-conditioning bar chart — PSL@λ vs Base-λ on each objective.
+
+    One subplot per preference preset (safety / speed / comfort), arranged in a
+    column (3 rows × 1 col).  Each subplot shows 3 grouped pairs of bars — one
+    pair per objective — so the owned objective stands out clearly.
+    Solid bars = PSL, hatched bars = scalarized baseline.
+    """
+    PRESETS = [
+        ("safety",  r"$\lambda_s$ (safety)", 0),
+        ("speed",   r"$\lambda_v$ (speed)",  1),
+        ("comfort", r"$\lambda_c$ (comfort)", 2),
+    ]
+    OBJ_LABELS  = [r"$f_{\rm safety}$", r"$f_{\rm speed}$", r"$f_{\rm comfort}$"]
+    OBJ_COLORS  = ["#d62728", "#1f77b4", "#8c564b"]
+
+    cond_data = results.get(sweep_label, {}).get(condition, {})
+    psl_data  = cond_data.get("psl",      {})
+    base_data = cond_data.get("baseline", {})
+
+    cond_pretty = condition.capitalize()
+    fig, axes = plt.subplots(3, 1, figsize=(8, 11))
+    fig.suptitle(
+        f"PSL@λ vs Scalarized Baseline — {cond_pretty} Traffic\n"
+        r"(solid = PSL, hatched = Baseline; highlighted = owned objective)",
+        fontsize=12, fontweight="bold", y=1.01,
+    )
+
+    bar_w  = 0.32
+    xs     = np.arange(3)          # one position per objective
+
+    for gi, (pref, subplot_title, owned_oi) in enumerate(PRESETS):
+        ax = axes[gi]
+        psl_costs  = psl_data.get(pref,  {}).get("costs",  [0, 0, 0])
+        base_costs = base_data.get(pref, {}).get("costs",  [0, 0, 0])
+        if psl_costs  is None: psl_costs  = [0, 0, 0]
+        if base_costs is None: base_costs = [0, 0, 0]
+
+        for oi in range(3):
+            alpha = 1.0 if oi == owned_oi else 0.45
+            color = OBJ_COLORS[oi]
+            ax.bar(xs[oi] - bar_w / 2, psl_costs[oi],
+                   width=bar_w, color=color, alpha=alpha,
+                   edgecolor="k", linewidth=0.8,
+                   label="PSL" if oi == 0 else "_")
+            ax.bar(xs[oi] + bar_w / 2, base_costs[oi],
+                   width=bar_w, color=color, alpha=alpha,
+                   hatch="///", edgecolor="k", linewidth=0.8,
+                   label="Baseline" if oi == 0 else "_")
+            # Value labels
+            for x_pos, val in [(xs[oi] - bar_w / 2, psl_costs[oi]),
+                                (xs[oi] + bar_w / 2, base_costs[oi])]:
+                ax.text(x_pos, val + 0.01, f"{val:.3f}",
+                        ha="center", va="bottom", fontsize=9)
+
+        # Highlight the owned objective column
+        ax.axvspan(xs[owned_oi] - 0.45, xs[owned_oi] + 0.45,
+                   alpha=0.08, color="gold", zorder=0)
+
+        ax.set_title(subplot_title, fontsize=12, fontweight="bold", loc="left")
+        ax.set_xticks(xs)
+        ax.set_xticklabels(OBJ_LABELS, fontsize=12)
+        ax.set_ylabel("Cost (↓ better)", fontsize=11)
+        ax.set_ylim(0, 0.72)
+        ax.grid(axis="y", alpha=0.3)
+        ax.legend(fontsize=10, loc="upper right")
+
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    out = os.path.join(save_dir, f"lambda_bars_{condition}.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    plt.show()
+    print(f"Lambda bar chart → {out}")

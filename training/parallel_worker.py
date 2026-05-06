@@ -119,12 +119,19 @@ def collect_pref_worker(args):
         per_obj = weighted.mean(dim=0) - entropy_coef * entropies.mean()  # (3,)
         policy_loss_vecs.append(per_obj.detach().cpu().numpy().copy())
 
-        # Per-step costs for EPO calibration (must be in [0, 1])
+        # Per-step costs for EPO calibration (must be in [0, 1]).
+        # For crash episodes, the crash penalty (1/(1-γ)) is a TERMINAL cost absorbed
+        # into returns but invisible to the per-step recovery formula G[t]-γG[t+1].
+        # EPO would see v_k_safety ≈ 0.2 (normal step costs) and think safety is fine,
+        # assigning low α[0] even though the episode just crashed. Fix: override safety
+        # v_k to 1.0 for crashed episodes so EPO correctly prioritises the safety gradient.
         if T > 1:
             rn = returns.detach().cpu().numpy()
-            mean_step_cost = (rn[:-1] - gamma * rn[1:]).mean(axis=0)
+            mean_step_cost = (rn[:-1] - gamma * rn[1:]).mean(axis=0).copy()
         else:
-            mean_step_cost = returns[0].detach().cpu().numpy()
+            mean_step_cost = returns[0].detach().cpu().numpy().copy()
+        if crashed:
+            mean_step_cost[0] = 1.0
         obj_values.append(mean_step_cost)
 
         # Critic gradient — graph is independent of policy (advantages are detached)
